@@ -1,0 +1,8 @@
+# dsh-cards-compaction — 背景產生歷史 cards，正式 compact 時一次替換
+#
+# 載入 profile 時插入一列：entry id 是 cards-compaction，模組是套件名。
+# 沒匯出 Config 時，config 原樣傳給 apply；匯出 Config 就必須是 standard-schema。
+- insert:
+    - id: cards-compaction
+      name: dsh-cards-compaction
+      config: {}
