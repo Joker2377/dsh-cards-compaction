@@ -32,6 +32,8 @@ jobs:
       # nor a release to exist. Bump it deliberately; a floating spec would change
       # CI without a commit.
       - name: Doctor
+        # bash on every OS: the Windows default is pwsh, where $RUNNER_TEMP is unset.
+        shell: bash
         run: |
           npm i --no-save --prefix "$RUNNER_TEMP/devkit" \
             "https://codeload.github.com/Joker2377/dsh-plugin-devkit/tar.gz/5fe794632bd5e2637c27f5ddf5642aeb2f1cd659"
