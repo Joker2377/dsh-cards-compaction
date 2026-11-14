@@ -36,7 +36,24 @@ https://github.com/Joker2377/dsh-cards-compaction
 > [!IMPORTANT]
 > **DSH 桌面 App（`dsh-web-app` profile）**：compaction 不在 host 層，而是每個 agent preset 各自在隔離的 `compaction` group 裡掛 `compaction-basic`。本外掛的 patch 碰不到 preset 裡的列，所以只裝外掛的話，preset agent 仍由 `compaction-basic` 壓縮。本外掛每次 hook 都向 preset registry（`agentPresets.serviceFor`，host 自己也這樣查）確認這個 agent 用的 compaction；不是自己就保持不動，log 會出現 `another compaction service owns this agent`。這個判斷在真 cordis 的隔離拓樸上測過，但 preset registry 用的是替身，尚未在 App 裡實測。
 >
-> 要在某個 preset 啟用本外掛：在 preset 編輯器的 `compaction` group 裡，把 `@deepseek-ai/dsh-compaction-basic` 那一列換成 `dsh-cards-compaction`（`command-compact`、`tool-result-pruner` 保留）。這條路**尚未驗證**。
+> 要只在某個 preset 啟用：先安裝本外掛，再把該 preset `compaction` group 裡的 `compaction-basic` 列換成本外掛（`command-compact`、`tool-result-pruner` 保留）。其他 preset 不受影響。preset 覆寫會取代整份子列表，所以建議另外新增一個 preset，不要直接改內建的。
+>
+> ```yaml
+> - id: compaction
+>   name: cordis:group
+>   group: true
+>   isolate:
+>     compaction: true
+>     toolResultPruner: true
+>   config:
+>     - id: cards-compaction
+>       name: dsh-cards-compaction
+>     - id: command-compact
+>       name: '@deepseek-ai/dsh-command-compact'
+>     # tool-result-pruner 照原 preset
+> ```
+>
+> preset 裡那份與 root 那份共用同一個 `cards_compaction_read_history` 工具。沒裝本外掛就引用這一列，該 preset 會沒有 compaction。這條路**尚未在 App 裡驗證**。
 
 設定值錯誤（鍵名打錯、型別不對）時本外掛拒絕載入；在 dsh-base 類 profile 裡內建 backend 也已被停用，此時沒有任何 compaction，log 會有載入錯誤。修正設定或移除本外掛即可恢復。
 

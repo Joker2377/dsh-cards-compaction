@@ -615,3 +615,23 @@ test('agent/disposed：中止進行中的背景卡，之後不再為該 session 
 	assert.equal(engine.maybeStartBackground(session), undefined)
 	void release
 })
+
+test('preset 與 root 各掛一份：read_history 已註冊時共用，不讓第二份掛載失敗；其他註冊錯誤照常拋出', () => {
+	const names = new Set()
+	const tools = {
+		register(tool) {
+			if (names.has(tool.name)) throw new Error(`tool "${tool.name}" is already registered (for a per-agent variant, register through that agent's \`agent.ctx\` instead)`)
+			names.add(tool.name)
+			return () => names.delete(tool.name)
+		},
+	}
+	const first = makeEngine()
+	first.ctx.tools = tools
+	first.engine.registerReadHistory()
+	const second = makeEngine()
+	second.ctx.tools = tools
+	assert.doesNotThrow(() => second.engine.registerReadHistory())
+	assert.equal(names.size, 1)
+	second.ctx.tools = { register() { throw new TypeError('tool "x" must declare output { schema, render, presentationMeta? }') } }
+	assert.throws(() => second.engine.registerReadHistory(), /must declare output/)
+})
