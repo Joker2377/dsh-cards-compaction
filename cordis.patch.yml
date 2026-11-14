@@ -1,8 +1,13 @@
-# dsh-cards-compaction — 背景產生歷史 cards，正式 compact 時一次替換
+# dsh-cards-compaction — background history cards, one verified checkpoint at compaction time.
 #
-# 載入 profile 時插入一列：entry id 是 cards-compaction，模組是套件名。
-# 沒匯出 Config 時，config 原樣傳給 apply；匯出 Config 就必須是 standard-schema。
+# One compaction owner per profile: this patch disables the built-in
+# compaction-basic row (dsh-base) and inserts this bundle. Removing the bundle
+# removes this patch, so compaction-basic comes back on its own.
+# /compact (command-compact) follows whichever ctx.compaction is mounted.
+- id: compaction-basic
+  name: '@deepseek-ai/dsh-compaction-basic'
+  disabled: true
+
 - insert:
     - id: cards-compaction
       name: dsh-cards-compaction
-      config: {}
