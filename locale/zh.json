@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "歷史卡片壓縮",
+    "description": "背景產生歷史卡片；context 不足時以一個驗證過的 checkpoint 取代歷史，並在對話中以可展開的列顯示。"
+  }
+}

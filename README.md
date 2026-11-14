@@ -17,6 +17,8 @@
 - 多輪 compact 沿用舊 cards；cards 超過預算時把最舊的幾張合併成 archive card；舊 overview 被取代，不會累加。
 - 原始紀錄留在 session log。模型可用 `cards_compaction_read_history` 以 card id 讀回原文（分頁、搜尋、digest）。
 - `/compact` 照常可用，改由本外掛執行。
+- **對話中看得到**：每次壓縮在對話裡出現一列，像工具呼叫一樣可以展開。進行中顯示經過時間；失敗顯示原因；成功時列出每張卡（id、涵蓋的 seq、內容）與 overview。
+- **`/cards`**：隨時查看目前的背景卡、context 用量、壓縮門檻與最近一次失敗。輸出只給你看，不會進入模型 context。
 
 ## 安裝
 
@@ -98,10 +100,11 @@ https://github.com/Joker2377/dsh-cards-compaction
 
 ## 運作原理
 
-- **背景產卡**：在 tool-pairing 平衡的邊界選出未覆蓋的區段，送出「原主線 prefix＋尾端指令」，請求前綴和主線逐項相同。輸出含 tool call、截斷或空白一律拒絕。結果驗證來源 digest 沒變才存成 READY，寫成 `plugin:dsh-cards-compaction/card` plugin record，重啟後可重用（使用前重驗）。
+- **背景產卡**：在 tool-pairing 平衡的邊界選出未覆蓋的區段，送出「原主線 prefix＋尾端指令」，請求前綴和主線逐項相同。輸出含 tool call、截斷或空白一律拒絕。結果驗證來源 digest 沒變才存成 READY，存進 host 的 storage-domain（domain `cards_compaction`，每個 session 一筆，不寫 session log），重啟後可重用（使用前重驗）。每個 session 最多留 64 張、最多留 200 個 session；沒有 storage-domain 時只存在記憶體。
 - **正式切換**：在 `agent/pre-step`（新輸入尚未進 log）以 host 的 `compaction/start`／`end` log 鎖包住整個交易：採用連續的 READY cards，尾段過大先補卡，最後一次請求讀完整 context 產生 `<tail_card>` 與 `<overview>`。覆蓋、lineage、checkpoint 確實變小、符合 `postCompactTargetRatio` 都通過，surface 也沒有被改動，才以一個 `user/message` replace 提交。任何失敗都保留原主線，並以帶錯誤的 `compaction/end` 釋放鎖。
 - **配額**：同一 process 內各 session 共用每個 provider 的 limiter。前景優先，背景只用空閒 slot。`providerConcurrency: 1`（預設）時背景卡只在 agent 閒置時啟動；使用者在背景卡進行中送出新訊息，下一步會等它結束（最多 `backgroundAttemptTimeoutMs`）。逾時放棄的請求在隔離期後才歸還 slot，前景重試也先等隔離期。
 - **擁有權**：每次 hook 先問 `agentPresets.serviceFor(agent, 'compaction')`（`agent.ctx` 看不到 preset 的隔離 realm），沒有 preset compaction 才看 `agent.ctx`；不是本 engine 就不做任何事。agent 結束（`agent/disposed`）時中止該 session 的背景卡。
+- **對話列**：前端從 log 裡既有的 `compaction/start`、`summary`、`end` 事件投影出來，自己不存狀態，重載後一樣正確。事件裡沒有 backend 名稱，所以「正在壓縮」與「壓縮失敗」兩種列對任何 backend 都會出現，文字也寫成任何 backend 都成立。其他 backend（例如 compaction-basic）的成功壓縮由 host 原本的列顯示；手動 `/compact` 一律交給指令卡顯示。本外掛自動壓縮成功時，host 原本的 compaction 列（展開是整段 checkpoint 原文）也會出現，和「歷史卡片」列各一列。背景卡不寫進 log，所以不會在產生當下出現一列，要看請用 `/cards`。
 - **checkpoint 文字**是確定性的：同樣的 cards 與 overview 產生同樣的文字，並能解析回 cards，下一輪靠它沿用舊 cards。
 
 ## 開發
@@ -126,6 +129,8 @@ DSH_HOST_NODE_MODULES=<那個 node_modules 目錄> npm test
 - `tool-result-pruner`、`image-offload` 仍可能改寫 surface；本外掛以 digest 偵測並丟棄過期的 card，不協調它們的寫入。
 - 圖片與音訊沒有特別處理；`read_history` 對圖片只顯示 `[image]`。
 - 只採用從 checkpoint 之後連續的 READY cards；中間有缺口時，缺口之後由最後一次請求補齊。
+- 對話列只在 host 0.2.2-rc.3 的 client 原始碼上對過介面、用離線測試驗證投影與元件，**尚未在真實 App 畫面中看過**。
+- 根層與 preset 各掛一份時，`/cards` 由先註冊的那份持有；那一份被停用或移除後，`/cards` 要等另一份重載才會回來。
 - devkit doctor 的 patch 讀取器不認得以 id 定位的停用列，會對 `cordis.patch.yml` 發一則 `patch/unreadable` 警告；這一列的寫法與 profile 自己的 patch 相同。
 
 ## 授權

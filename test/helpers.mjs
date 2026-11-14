@@ -5,6 +5,7 @@
  */
 import { CardsCompactor } from '../lib/engine.js'
 import { QuotaLimiter } from '../lib/limiter.js'
+import { CardStore } from '../lib/store.js'
 
 const SURFACE_TYPES = new Set(['system/message', 'user/message', 'assistant/message', 'tool/result'])
 
@@ -54,12 +55,6 @@ export class FakeSession {
 		}
 		for (const listener of this.listeners) listener(event)
 		return event
-	}
-
-	appendPluginRecord(type, data) {
-		const event = Object.freeze({ type, seq: this.log.length, time: 0, data, ignorable: true })
-		this.log.push(event)
-		return event.seq
 	}
 
 	// --- conversation builders ---
@@ -178,11 +173,36 @@ export const TEST_CONFIG = {
 	quarantineMs: 10,
 }
 
-export function makeEngine({ config = {}, ctxOptions = {}, model = new FakeModel(), capacity = 1 } = {}) {
+/** Domain table stand-in with the storage-domain method shapes the store uses. */
+export class FakeTable {
+	constructor() {
+		this.records = new Map()
+		this.writes = 0
+	}
+	get(key) { return this.records.get(key) }
+	entries() { return [...this.records.entries()][Symbol.iterator]() }
+	async put(key, value) {
+		this.writes += 1
+		this.records.set(key, value)
+	}
+	async deleteMany(keys) {
+		for (const key of keys) this.records.delete(key)
+		return keys.length
+	}
+}
+
+/** An already-open card store over a FakeTable (one per engine unless shared). */
+export function memoryStore(table = new FakeTable()) {
+	const store = new CardStore()
+	store.table = table
+	return store
+}
+
+export function makeEngine({ config = {}, ctxOptions = {}, model = new FakeModel(), capacity = 1, store = memoryStore() } = {}) {
 	const ctx = fakeContext(ctxOptions)
 	const limiter = new QuotaLimiter({ capacity, quarantineMs: 10 })
-	const engine = new CardsCompactor(ctx, { ...TEST_CONFIG, ...config }, { limiter, generate: model.generate })
-	return { ctx, engine, model, limiter }
+	const engine = new CardsCompactor(ctx, { ...TEST_CONFIG, ...config }, { limiter, generate: model.generate, store })
+	return { ctx, engine, model, limiter, store }
 }
 
 export function fakeAgent(session) {

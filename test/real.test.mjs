@@ -1,7 +1,7 @@
 /**
  * Real-host layer: the engine against the host's own dsh-session Session,
  * dsh-compaction base class and checkpoint source, dsh-llm message factories,
- * and plugin records. Skips unless DSH_HOST_NODE_MODULES points at a host
+ * and the card store. Skips unless DSH_HOST_NODE_MODULES points at a host
  * node_modules directory (for example extracted from the installed App's
  * app.asar); see README「開發」.
  */
@@ -83,20 +83,6 @@ test('real host：我們的合法邊界與 host toolPairingBalancedAfter 逐點�
 	assert.deepEqual(ours, nodes.map((seq) => loaded.compaction.toolPairingBalancedAfter(session, seq)))
 })
 
-test('real host：背景卡寫成 plugin record，pluginRecordOf 讀得回來', { skip }, async () => {
-	const loaded = await load()
-	const { engine } = loaded.helpers.makeEngine()
-	const session = realSession(loaded, 6)
-	await engine.maybeStartBackground(session)
-	const records = []
-	for (let seq = 0; seq < session.seq; seq += 1) {
-		const record = loaded.session.pluginRecordOf(session.eventAt(seq))
-		if (record) records.push(record)
-	}
-	assert.equal(records.length, 1)
-	assert.equal(records[0].type, loaded.engineModule.CARD_RECORD)
-	assert.ok(!session.surface.nodes.includes(records[0].seq), 'record 不進 surface')
-})
 
 test('real host：finalize 一次替換，衍生訊息變成 system + checkpoint，原文仍可讀回', { skip }, async () => {
 	const loaded = await load()
@@ -173,4 +159,46 @@ test('real host：preset 隔離的 compaction 對 agent.ctx 不可見；owns() �
 	assert.equal(agentCtx.get('compaction', false).compactor, ours.compactor, 'agent.ctx 只看得到 root 的 compaction')
 	assert.equal(ours.compactor.owns(agent), false)
 	assert.equal(ours.compactor.owns({ ctx: agentCtx, session }), true, '沒有 preset compaction（dsh-base）時照常擁有')
+})
+
+test('real host：card store 經真的 storage-domain＋json backend 寫入並在重開後讀回', { skip }, async () => {
+	await load()
+	const { mkdtemp, rm } = await import('node:fs/promises')
+	const { tmpdir } = await import('node:os')
+	const { join } = await import('node:path')
+	const { Context } = await import('@deepseek-ai/cordis')
+	const storage = await import('@deepseek-ai/dsh-storage')
+	const json = await import('@deepseek-ai/dsh-storage-json')
+	const domainModule = await import('@deepseek-ai/dsh-storage-domain')
+	const { CardStore } = await import('../lib/store.js')
+	const { host } = await import('../lib/host.js')
+	assert.ok(host.storageDomain, 'host 套件提供 defineDomain/domainTable')
+	const root = await mkdtemp(join(tmpdir(), 'cards-store-'))
+	const mount = async () => {
+		const ctx = new Context()
+		await ctx.plugin(storage.default, {})
+		await ctx.plugin(json, { root })
+		await ctx.plugin(domainModule, { backend: 'json' })
+		await new Promise((resolve) => setTimeout(resolve, 50))
+		const facility = ctx.get('storageDomain', false)
+		assert.ok(facility, 'storageDomain 已提供')
+		return { ctx, facility }
+	}
+	try {
+		const first = await mount()
+		const store = new CardStore()
+		const release = store.acquire(first.facility, host.storageDomain, (message) => assert.fail(message))
+		await store.ready()
+		await store.save('session-a', [{ id: 'c1-3', seqs: [1, 2, 3], depth: 0, body: 'card body', digest: 'd' }], 1)
+		await release()
+
+		const second = await mount()
+		const reopened = new CardStore()
+		const release2 = reopened.acquire(second.facility, host.storageDomain, (message) => assert.fail(message))
+		await reopened.ready()
+		assert.deepEqual(reopened.load('session-a'), [{ id: 'c1-3', seqs: [1, 2, 3], body: 'card body', digest: 'd' }])
+		await release2()
+	} finally {
+		await rm(root, { recursive: true, force: true })
+	}
 })

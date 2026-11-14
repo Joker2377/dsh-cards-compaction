@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Cards Compaction",
+    "description": "Background history cards; one verified checkpoint replaces history when context runs low, shown as an expandable row in chat."
+  }
+}

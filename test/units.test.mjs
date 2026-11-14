@@ -212,3 +212,198 @@ test('limiter：重載後放大容量，排隊中的前景立刻拿到 slot', as
 	held.release()
 	second.release()
 })
+
+// --- card store ---------------------------------------------------------------------
+
+import { CardStore, MAX_SESSIONS, MAX_CARDS_PER_SESSION, recordProblem, sessionRecordSchema } from '../lib/store.js'
+import { FakeTable } from './helpers.mjs'
+
+function fakeFacility() {
+	const facility = { opened: 0, closed: 0, table: new FakeTable() }
+	facility.live = false
+	// Like DomainFacility: a name still open (or closing) rejects another open.
+	facility.open = async (spec) => {
+		if (facility.live) throw new Error(`domain '${spec.name}' is already open`)
+		facility.live = true
+		facility.opened += 1
+		facility.spec = spec
+		return {
+			table: () => facility.table,
+			close: async () => {
+				await new Promise((resolve) => setTimeout(resolve, 5))
+				facility.closed += 1
+				facility.live = false
+			},
+		}
+	}
+	return facility
+}
+const api = { defineDomain: (spec) => spec, domainTable: (schema) => ({ valueSchema: schema }) }
+
+test('card store：root 與 preset 兩份共用一次 open，最後一份釋放才 close', async () => {
+	const store = new CardStore()
+	const facility = fakeFacility()
+	const releaseA = store.acquire(facility, api)
+	const releaseB = store.acquire(facility, api)
+	await store.ready()
+	assert.equal(facility.opened, 1)
+	assert.equal(facility.spec.name, 'cards_compaction')
+	await releaseA()
+	await releaseA()
+	assert.equal(facility.closed, 0)
+	await releaseB()
+	assert.equal(facility.closed, 1)
+	assert.deepEqual(store.load('s'), [])
+})
+
+test('card store：沒有 storage-domain 時只在記憶體，save 不報錯', async () => {
+	const store = new CardStore()
+	store.acquire(undefined, api)
+	await store.save('s', [{ id: 'c1-2', seqs: [1, 2], body: 'b', digest: 'd' }], 1)
+	assert.deepEqual(store.load('s'), [])
+})
+
+test('card store：每個 session 留最新的 cards，超過上限的舊 session 被刪', async () => {
+	const store = new CardStore()
+	store.table = new FakeTable()
+	const many = Array.from({ length: MAX_CARDS_PER_SESSION + 5 }, (_, i) => ({ id: `c${i}-${i}`, seqs: [i], body: 'b', digest: 'd', depth: 0 }))
+	await store.save('s0', many, 0)
+	assert.equal(store.load('s0').length, MAX_CARDS_PER_SESSION)
+	assert.equal(store.load('s0')[0].id, 'c5-5')
+	for (let i = 1; i <= MAX_SESSIONS; i += 1) await store.save(`s${i}`, [], i)
+	assert.equal(store.table.records.size, MAX_SESSIONS)
+	assert.equal(store.load('s0').length, 0, '最舊的 session 被刪')
+})
+
+test('card store schema：只接受本模組寫的形狀', () => {
+	assert.equal(recordProblem({ v: 1, updatedAt: 1, cards: [{ id: 'c1', seqs: [1], body: 'b', digest: 'd' }] }), undefined)
+	assert.throws(() => sessionRecordSchema.parse({ v: 2, updatedAt: 1, cards: [] }), /version/)
+	assert.throws(() => sessionRecordSchema.parse({ v: 1, updatedAt: 1, cards: [{ id: 'c1', seqs: [-1], body: 'b', digest: 'd' }] }), /seqs/)
+})
+
+// --- /cards status -------------------------------------------------------------------
+
+import { preview, ranges, renderStatus } from '../lib/status.js'
+
+test('/cards 文字：seq 範圍、預覽、別人的 compaction', () => {
+	assert.equal(ranges([1, 2, 3, 7, 9, 10]), '1-3,7,9-10')
+	assert.equal(preview('\n  first line\nsecond'), 'first line')
+	assert.equal(preview('x'.repeat(300)).length, 120)
+	assert.match(renderStatus({ owner: 'foreign' }), /inactive for this agent/)
+	const text = renderStatus({
+		owner: 'owned',
+		status: { state: 'idle', failures: 1, lastError: 'foreground request timed out', lastErrorAt: 1000 },
+		context: { total: 50, window: 100, finalizeAt: 65 },
+		cards: [{ id: 'c1-3', seqs: [1, 2, 3], body: 'ran tests', valid: true }, { id: 'c4-5', seqs: [4, 5], body: 'old', valid: false }],
+		background: { used: 10, budget: 100 },
+		now: 4000,
+	})
+	assert.match(text, /idle \(1 failed attempt\)/)
+	assert.match(text, /~50 tokens of 100 \(50%\); compacts at 65 \(65%\)/)
+	assert.match(text, /Last failure \(3s ago\): foreground request timed out/)
+	assert.match(text, /1 ready, 1 stale/)
+	assert.match(text, /- c1-3 · seqs 1-3 · 3 events\n  ran tests/)
+	assert.match(text, /- c4-5 · seqs 4-5 · 2 events · stale/)
+})
+
+test('card store：最後一份正在關閉時新的 acquire 會等關完再重開', async () => {
+	const store = new CardStore()
+	const facility = fakeFacility()
+	const release = store.acquire(facility, api)
+	await store.ready()
+	const closing = release()
+	const releaseNew = store.acquire(facility, api)
+	await closing
+	await store.ready()
+	assert.equal(facility.opened, 2)
+	assert.equal(facility.closed, 1)
+	assert.ok(store.table, '重開後有 table')
+	await releaseNew()
+	assert.equal(facility.closed, 2)
+})
+
+test('card store：storage-domain 重載換 facility 時改開新的；舊 domain 關閉後 load 不丟錯', async () => {
+	const store = new CardStore()
+	const first = fakeFacility()
+	const releaseRoot = store.acquire(first, api)
+	const releasePreset = store.acquire(first, api)
+	await store.ready()
+	const second = fakeFacility()
+	await releaseRoot()
+	const releaseRoot2 = store.acquire(second, api)
+	await store.ready()
+	assert.equal(first.closed, 1, '舊 facility 的 domain 要關掉')
+	assert.equal(second.opened, 1)
+	assert.equal(store.table, second.table)
+	await releasePreset()
+	await releaseRoot2()
+
+	const closed = new CardStore()
+	closed.table = { get() { throw new Error("domain 'cards_compaction' is closed") } }
+	assert.deepEqual(closed.load('s'), [])
+	assert.equal(closed.table, undefined)
+})
+
+test('card store：domain 關閉失敗不留下未處理的 rejection，之後仍能重開', async () => {
+	const store = new CardStore()
+	const facility = fakeFacility()
+	facility.open = async () => ({ table: () => facility.table, close: async () => { throw new Error('unit close failed') } })
+	const unhandled = []
+	const onUnhandled = (error) => unhandled.push(error)
+	process.on('unhandledRejection', onUnhandled)
+	try {
+		const release = store.acquire(facility, api)
+		await store.ready()
+		const closing = release()
+		const again = store.acquire(facility, api)
+		await closing
+		await store.ready()
+		await new Promise((resolve) => setTimeout(resolve, 10))
+		assert.equal(unhandled.length, 0)
+		assert.ok(store.table)
+		await again()
+	} finally {
+		process.off('unhandledRejection', onUnhandled)
+	}
+})
+
+test('card store：舊 open 還在跑時換 facility，舊的自己關掉；換 facility 時舊 domain 關閉失敗也能開新的', async () => {
+	const store = new CardStore()
+	const slow = fakeFacility()
+	const open = slow.open
+	slow.open = async (spec) => { await new Promise((resolve) => setTimeout(resolve, 10)); return open(spec) }
+	const releaseA = store.acquire(slow, api)
+	const releaseB = store.acquire(slow, api)
+	const fresh = fakeFacility()
+	await releaseA()
+	const releaseA2 = store.acquire(fresh, api)
+	await store.ready()
+	await new Promise((resolve) => setTimeout(resolve, 20))
+	assert.equal(slow.closed, slow.opened, '舊 open 完成後自己關掉')
+	assert.equal(store.table, fresh.table)
+	await releaseB()
+	await releaseA2()
+
+	const broken = fakeFacility()
+	broken.open = async () => ({ table: () => broken.table, close: async () => { throw new Error('unit close failed') } })
+	const unhandled = []
+	const onUnhandled = (error) => unhandled.push(error)
+	process.on('unhandledRejection', onUnhandled)
+	try {
+		const other = new CardStore()
+		const r1 = other.acquire(broken, api)
+		const r2 = other.acquire(broken, api)
+		await other.ready()
+		const next = fakeFacility()
+		await r1()
+		const r3 = other.acquire(next, api)
+		await other.ready()
+		await new Promise((resolve) => setTimeout(resolve, 10))
+		assert.equal(unhandled.length, 0)
+		assert.equal(other.table, next.table)
+		await r2()
+		await r3()
+	} finally {
+		process.off('unhandledRejection', onUnhandled)
+	}
+})

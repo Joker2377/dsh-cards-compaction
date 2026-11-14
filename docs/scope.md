@@ -26,7 +26,8 @@
 | 5 | 原子寫入與恢復 | 沒有整組交易。replace 是單一事件；鎖包住它，崩潰留下可偵測的未配對 start，重啟後由 end-seed 判定為過期 | 同上 |
 | 6 | 共用 quota limiter | host 沒有；本外掛自建 process 內 limiter | 搜尋 `dsh-llm`、`dsh-llm-retry` 無對應 API |
 | 7 | 原文查閱 | 被替換的事件留在 session log，工具執行時可由 `exec.agent.session` 讀；host 沒有給模型用的查閱工具，所以註冊 `cards_compaction_read_history` | `dsh-tools` exec、`deriveEventMessage` |
-| — | 背景 cards 的持久化 | `appendPluginRecord`：可遺失、不進 surface、fork／resume 會帶著 | `dsh-session` |
+| — | 背景 cards 的持久化 | host 規定 repo 外的外掛不得呼叫 `appendPluginRecord`，改用 `ctx.storageDomain`（每個 session 一筆，可遺失） | `dsh-session` README「Write experimental plugin records」、`dsh-storage-domain` |
+| — | 前端顯示 | client 以 `uiConversation.events.register` 投影 compaction 生命週期事件，`conversation.chat.node` 依 kind 渲染；`/cards` 指令輸出不進模型 | `dsh-client-ui-conversation`、`dsh-client-ui-goal`、`dsh-commands` README |
 | — | 替換內建 backend | dsh-base 類 profile：bundle patch 以 id 停用 host 層 `compaction-basic` 再插入本列；移除外掛就恢復 | `dsh-base/cordis.patch.yml` |
 | — | web-app profile（桌面 App） | `dsh-web-app` 已停用 host 層 basic，改在每個 agent preset 的隔離 `compaction` group 掛 basic；bundle patch 進不去 preset 的 `config.plugins`。`agent.ctx` 看不到 preset 的隔離 realm，本外掛在執行期以 `agentPresets.serviceFor(agent, 'compaction')` 判斷，不是自己就不動。要在 preset 啟用，得在 preset 的 compaction group 換列（未驗證） | `dsh-web-app/presets/*.patch.yml`、`dsh-agent-preset-registry` README |
 
@@ -70,7 +71,7 @@
 | AC33 不支援的 host | 通過（U） | `engines.dsh` 限制版本；缺 host 套件時 apply 拒絕載入 |
 | AC34 停用、更新 schema | 部分 | 停用時取消背景工作（E）；移除外掛後 checkpoint 仍是一般 user 訊息，但 `read_history` 隨外掛消失 |
 | AC35 無限重試 | 通過（E） | 連續失敗兩次後 BLOCKED |
-| AC37 重啟 | 通過（E） | READY card 從 plugin record 重建，使用前重驗 |
+| AC37 重啟 | 通過（E、R） | READY card 存在 host storage-domain（R：真的 json backend 重開後讀回），使用前重驗 |
 | AC38 半份結果 | 通過（U、E） | |
 
 ## 不做（v1）
@@ -78,7 +79,7 @@
 - 圖片、音訊、外部附件的完整支援（spec §12）。
 - 備援模型路由（spec §18）。
 - 完整 context 超出摘要輸入上限時以 cards 代替原文的降級模式（spec §13）。
-- 使用者可見的狀態列（spec §19 的四類狀態目前只寫 log）。
+- 常駐的狀態列（spec §19）。目前以對話中的壓縮列與 `/cards` 指令呈現，未在真實 App 畫面驗證。
 - 不連續 READY cards 的採用（只接受連續前綴，spec §9）。
 
 ## 尚未驗證

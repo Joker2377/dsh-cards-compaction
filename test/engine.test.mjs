@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { messageText, parseCheckpoint } from '../lib/checkpoint.js'
-import { CARD_RECORD, CardsCompactor, inspectEntryState } from '../lib/engine.js'
+import { CardsCompactor, inspectEntryState } from '../lib/engine.js'
 import { QuotaLimiter } from '../lib/limiter.js'
 import { createReadHistoryTool } from '../lib/tools.js'
 import { FakeModel, FakeSession, TEST_CONFIG, fakeAgent, fakeContext, makeEngine } from './helpers.mjs'
@@ -31,8 +31,8 @@ const deferred = () => {
 
 // --- background -------------------------------------------------------------------
 
-test('背景產卡：不改主線，READY card 存進 plugin record', async () => {
-	const { engine, model } = makeEngine()
+test('背景產卡：不改主線、不寫 log，READY card 存進 card store', async () => {
+	const { engine, model, store } = makeEngine()
 	const session = working()
 	const surfaceBefore = [...session.nodes]
 	await engine.maybeStartBackground(session)
@@ -40,9 +40,9 @@ test('背景產卡：不改主線，READY card 存進 plugin record', async () =
 	const [card] = engine.state(session).cards.values()
 	assert.ok(card, 'card READY')
 	assert.equal(card.seqs[0], session.nodes[1], '從 system 之後開始')
-	const record = session.log.find((event) => event.type === CARD_RECORD)
-	assert.equal(record.ignorable, true)
-	assert.equal(record.data.id, card.id)
+	assert.ok(!session.log.some((event) => /^plugin:/.test(event.type)), '不寫 plugin record')
+	await new Promise((resolve) => setTimeout(resolve, 0))
+	assert.deepEqual(store.load(session.id).map((stored) => stored.id), [card.id], '存進 card store')
 	assert.equal(model.calls.length, 1)
 })
 
@@ -397,14 +397,15 @@ test('/compact：有 open turn 時回 busy', async () => {
 
 // --- restart and reader -------------------------------------------------------------
 
-test('重啟：從 plugin record 重建 READY card，採用前重驗來源', async () => {
+test('重啟：從 card store 重建 READY card，採用前重驗來源', async () => {
 	const first = makeEngine()
 	const session = working()
 	await first.engine.maybeStartBackground(session)
 	const [card] = first.engine.state(session).cards.values()
 
 	const model = new FakeModel()
-	const engine = new CardsCompactor(fakeContext(), TEST_CONFIG, { limiter: new QuotaLimiter({ capacity: 1, quarantineMs: 0 }), generate: model.generate })
+	await new Promise((resolve) => setTimeout(resolve, 0))
+	const engine = new CardsCompactor(fakeContext(), TEST_CONFIG, { limiter: new QuotaLimiter({ capacity: 1, quarantineMs: 0 }), generate: model.generate, store: first.store })
 	assert.ok(engine.state(session).cards.has(card.id))
 	await engine.finalize(fakeAgent(session), AUTO)
 	assert.equal(checkpointOf(session).cards[0].body, card.body)
@@ -684,4 +685,61 @@ test('BLOCKED 後接近視窗上限：再試最後一次而不是放任 overflow
 	assert.ok(result, '最後一次成功')
 	assert.ok(model.calls.length > calls)
 	assert.equal(engine.state(session).blocked, false)
+})
+
+// --- /cards command --------------------------------------------------------------------
+
+test('/cards：列出背景卡與狀態；別的 compaction 擁有時說明未啟用；重複註冊共用', async () => {
+	const commands = new Map()
+	const registry = {
+		register(definition) {
+			if (commands.has(definition.name)) throw new Error(`command "${definition.name}" is already registered in this scope`)
+			commands.set(definition.name, definition)
+			return () => commands.delete(definition.name)
+		},
+	}
+	const { engine, ctx } = makeEngine()
+	ctx.commands = registry
+	engine.registerCommand()
+	const second = makeEngine()
+	second.ctx.commands = registry
+	assert.doesNotThrow(() => second.engine.registerCommand())
+
+	const session = working(12)
+	await engine.maybeStartBackground(session)
+	const handler = commands.get('cards').handler
+	const text = (await handler({ agent: fakeAgent(session), signal: new AbortController().signal })).text
+	assert.match(text, /cards-compaction: idle/)
+	assert.match(text, /Background cards: 1 ready/)
+	assert.match(text, /- c\d+-\d+ · seqs /)
+
+	const foreign = ownedEngine()
+	foreign.ctx.commands = new Map() && { register: (definition) => { foreign.handler = definition.handler; return () => {} } }
+	foreign.engine.registerCommand()
+	const agent = scopedAgent(working(), foreign.engine, { compactor: {} })
+	assert.match((await foreign.handler({ agent })).text, /inactive for this agent/)
+})
+
+test('finalize 採用背景卡後，store 也移除；重啟不會把已採用的卡列成 stale', async () => {
+	const { engine, store } = makeEngine()
+	const session = working(12)
+	await engine.maybeStartBackground(session)
+	await sleep(5)
+	assert.ok(store.load(session.id).length > 0)
+	await engine.finalize(fakeAgent(session), AUTO)
+	await sleep(5)
+	assert.equal(store.load(session.id).length, 0)
+	const restarted = new CardsCompactor(fakeContext(), TEST_CONFIG, { limiter: new QuotaLimiter({ capacity: 1, quarantineMs: 0 }), generate: new FakeModel().generate, store })
+	assert.equal(restarted.state(session).cards.size, 0)
+})
+
+test('重啟時來源已被改寫的卡不載入', async () => {
+	const { engine, store } = makeEngine()
+	const session = working()
+	await engine.maybeStartBackground(session)
+	await sleep(5)
+	const [stored] = store.load(session.id)
+	store.table.records.set(session.id, { v: 1, updatedAt: 1, cards: [{ ...stored, digest: 'changed' }] })
+	const restarted = new CardsCompactor(fakeContext(), TEST_CONFIG, { limiter: new QuotaLimiter({ capacity: 1, quarantineMs: 0 }), generate: new FakeModel().generate, store })
+	assert.equal(restarted.state(session).cards.size, 0)
 })
