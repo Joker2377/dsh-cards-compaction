@@ -88,7 +88,8 @@ https://github.com/Joker2377/dsh-cards-compaction
 | 症狀 | 原因 | 做法 |
 | --- | --- | --- |
 | log 出現 `auto finalize disabled for <provider>/<model>` | 該模型沒有 contextWindow，或視窗放不下輸出預留 | 在 adapter 設 `contextWindow`，或調小 `nextStepReserveTokens`、`finalMaxOutputTokens` |
-| log 出現 `BLOCKED` | 連續兩次切換失敗（模型錯誤、輸出格式錯、checkpoint 沒有變小或超出目標） | 看前面的 `finalize failed` 原因；`/compact` 成功後自動解除 |
+| `compaction/end` 錯誤是 `timed out: no output for …` | 本地或很慢的模型在 prefill 期間太久沒有輸出 | 調大 `attemptIdleTimeoutMs`（預設 180000）；總長上限是 `finalAttemptTimeoutMs`、`backgroundAttemptTimeoutMs` |
+| log 出現 `BLOCKED` | 連續兩次切換失敗（模型錯誤、輸出格式錯、checkpoint 沒有變小或超出目標） | 看前面的 `finalize failed` 原因；`/compact` 成功後自動解除。接近視窗上限時仍會自動再試一次 |
 | 對話仍然撞到 context 上限 | 單步新增內容超過 `nextStepReserveTokens`，或 BLOCKED | 調大 `nextStepReserveTokens`；本外掛不在 overflow 時以 cards 代替完整輸入（spec §13） |
 | log 出現 `another compaction service owns this agent` | agent preset 自己掛了 `compaction-basic` | 見「安裝」的 preset 說明 |
 | 外掛載入失敗、也沒有任何 compaction | 設定值錯誤，或不在 DSH 內執行 | 修正 `cards-compaction` 列的 `config`，或移除外掛 |

@@ -635,3 +635,53 @@ test('preset 與 root 各掛一份：read_history 已註冊時共用，不讓第
 	second.ctx.tools = { register() { throw new TypeError('tool "x" must declare output { schema, render, presentationMeta? }') } }
 	assert.throws(() => second.engine.registerReadHistory(), /must declare output/)
 })
+
+// --- slow local providers (session d9e46833: 27B on llama.cpp hit the 90 s cap) ---
+
+test('慢但持續輸出的請求：每個 chunk 重設閒置計時，不因總長短的閒置上限中止', async () => {
+	const { engine, model } = makeEngine({ config: { attemptIdleTimeoutMs: 60, finalAttemptTimeoutMs: 5000, backgroundAttemptTimeoutMs: 5000 } })
+	const session = working()
+	const base = model.respond
+	model.respond = async (kind, request) => {
+		for (let i = 0; i < 6; i += 1) {
+			await sleep(25)
+			request.onProgress?.()
+		}
+		request.signal?.throwIfAborted()
+		return base(kind, request)
+	}
+	await engine.finalize(fakeAgent(session), AUTO)
+	assert.ok(checkpointOf(session), '總耗時超過閒置上限仍完成')
+})
+
+test('完全沒有輸出：以逾時錯誤結束，訊息寫明原因與設定鍵，不是 Request was aborted', async () => {
+	const { engine, model } = makeEngine({ config: { attemptIdleTimeoutMs: 40, maxAttemptsPerRequest: 1 } })
+	const session = working()
+	model.respond = (kind, request) => new Promise((_, reject) => request.signal.addEventListener('abort', () => reject(new Error('Request was aborted'))))
+	const before = session.nodes.length
+	await assert.rejects(engine.finalize(fakeAgent(session), AUTO), /timed out: no output for .*attemptIdleTimeoutMs/)
+	assert.equal(session.nodes.length, before, '主線不變')
+})
+
+test('BLOCKED 後接近視窗上限：再試最後一次而不是放任 overflow；成功後解除 BLOCKED', async () => {
+	const { engine, model } = makeEngine({ ctxOptions: { contextWindow: 6000, defaultMaxTokens: 500 }, config: { nextStepReserveTokens: 200, finalMaxOutputTokens: 300 } })
+	const session = working(20, 1200)
+	const base = model.respond
+	model.respond = () => { throw new Error('provider down') }
+	const agent = fakeAgent(session)
+	await assert.rejects(engine.pressure(agent, undefined, 0))
+	session.step('grow', 2000)
+	await assert.rejects(engine.pressure(agent, undefined, 0))
+	assert.equal(engine.state(session).blocked, true)
+	const limits = await engine.limitsFor(session.requestHeader())
+	assert.ok(limits.lastResortAt > limits.finalizeAt)
+	// Retries stay spaced by retryAfterTokens; grow past both thresholds.
+	const floor = Math.max(limits.lastResortAt, engine.state(session).retryAfterTokens)
+	while (engine.ctx.tokenMeter.measure(session).totalTokens < floor) session.step('grow', 2000)
+	model.respond = base
+	const calls = model.calls.length
+	const result = await engine.pressure(agent, undefined, 0)
+	assert.ok(result, '最後一次成功')
+	assert.ok(model.calls.length > calls)
+	assert.equal(engine.state(session).blocked, false)
+})
