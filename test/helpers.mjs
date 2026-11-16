@@ -129,7 +129,7 @@ export class FakeModel {
 
 	generate = async (request) => {
 		const kind = this.kindOf(request.instruction)
-		this.calls.push({ kind, ...request })
+		this.calls.push({ ...request, requestKind: request.kind, kind })
 		const text = await this.respond(kind, request)
 		return { text, usage: { inputTokens: 10, outputTokens: 5 } }
 	}

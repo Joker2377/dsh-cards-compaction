@@ -1,6 +1,6 @@
 {
   "name": "dsh-cards-compaction",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Background history-card compaction for DeepSeek Harness, with a chat row that shows each compaction",
   "type": "module",
   "main": "./lib/index.js",

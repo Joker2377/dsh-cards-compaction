@@ -35,8 +35,8 @@ test('Config：錯型別、未知鍵、越界比例、互相矛盾的值都回 i
 test('pressureLimits：主線輸出預留與最後摘要輸出預留相加，不取最大值', () => {
 	const config = { ...DEFAULTS, finalizeSoftRatio: 0.99, estimateBufferRatio: 0.01 }
 	const limits = pressureLimits(config, { contextWindow: 100000, mainReserve: 20000, finalInstructionTokens: 500 })
-	// 100000 - 20000 - 16384 - 500 - 8192 - 1000
-	assert.equal(limits.finalizeAt, 53924)
+	// 100000 - 20000 - 16384 - 500 - 12500（視窗的 1/8）- 1000
+	assert.equal(limits.finalizeAt, 49616)
 })
 
 test('pressureLimits：視窗放不下預留時回 infeasible，不回負數門檻', () => {
@@ -406,4 +406,26 @@ test('card store：舊 open 還在跑時換 facility，舊的自己關掉；換 
 	} finally {
 		process.off('unhandledRejection', onUnhandled)
 	}
+})
+
+test('acceptOutput：截斷訊息寫出上限並提醒 reasoning 也算在內', async () => {
+	const { acceptOutput } = await import('../lib/generate.js')
+	assert.throws(() => acceptOutput([], { kind: 'max-tokens' }, { kind: 'tail card', maxTokens: 4096, outputTokens: 4096 }), /^GenerationError: tail card output truncated at the 4096-token cap after 4096 output tokens \(reasoning counts toward it\)$/)
+})
+
+test("finalOutputCap：最後一步上限取 finalMaxOutputTokens 與視窗 1/8 的較小者；小視窗仍有可用門檻", async () => {
+	const { finalOutputCap } = await import("../lib/config.js")
+	assert.equal(finalOutputCap(DEFAULTS, 262144), 32768)
+	assert.equal(finalOutputCap(DEFAULTS, 65536), 8192)
+	assert.equal(finalOutputCap(DEFAULTS, 16384), DEFAULTS.cardMaxOutputTokens)
+	assert.equal(finalOutputCap(DEFAULTS, undefined), 32768)
+	const limits = pressureLimits(DEFAULTS, { contextWindow: 65536, mainReserve: 0, finalInstructionTokens: 725 })
+	assert.ok(!limits.infeasible && limits.finalizeAt > 30000, JSON.stringify(limits))
+	assert.ok(!pressureLimits(DEFAULTS, { contextWindow: 48000, mainReserve: 0, finalInstructionTokens: 725 }).infeasible)
+})
+
+test("retryable：context 超過上限不重試", async () => {
+	const { retryable } = await import("../lib/generate.js")
+	assert.equal(retryable({ code: "CONTEXT_WINDOW_EXCEEDED" }), false)
+	assert.equal(retryable(new Error("x")), true)
 })

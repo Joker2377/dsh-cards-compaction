@@ -743,3 +743,150 @@ test('重啟時來源已被改寫的卡不載入', async () => {
 	const restarted = new CardsCompactor(fakeContext(), TEST_CONFIG, { limiter: new QuotaLimiter({ capacity: 1, quarantineMs: 0 }), generate: new FakeModel().generate, store })
 	assert.equal(restarted.state(session).cards.size, 0)
 })
+
+test('補卡被截斷：上限加倍重試、不耗用重試次數，之後的卡沿用加大的上限', async () => {
+	const { engine, model } = makeEngine()
+	const session = working(12)
+	const respond = model.respond
+	model.respond = (kind, request) => {
+		if (kind === 'card' && request.maxTokens < 1000) throw Object.assign(new Error('output truncated'), { code: 'MAX_TOKENS' })
+		return respond(kind, request)
+	}
+	await engine.finalize(fakeAgent(session), AUTO)
+	const caps = model.calls.filter((call) => call.kind === 'card').map((call) => call.maxTokens)
+	assert.deepEqual(caps.slice(0, 2), [500, 1000])
+	assert.ok(caps.slice(2).every((cap) => cap === 1000), JSON.stringify(caps))
+	assert.equal(engine.state(session).cardCap, 1000)
+})
+
+test('上限不超過 finalMaxOutputTokens 與 context 剩餘空間；最後一步截斷不再用同一上限重試', async () => {
+	const { engine, model, ctx } = makeEngine()
+	const session = working()
+	const respond = model.respond
+	model.respond = (kind, request) => {
+		if (kind === 'final') throw Object.assign(new Error('output truncated'), { code: 'MAX_TOKENS' })
+		return respond(kind, request)
+	}
+	await assert.rejects(engine.finalize(fakeAgent(session), AUTO), /truncated/)
+	assert.deepEqual(model.calls.filter((call) => call.kind === 'final').map((call) => call.maxTokens), [1000])
+
+	const b = makeEngine()
+	b.model.respond = model.respond
+	const other = working()
+	const window = b.ctx.tokenMeter.measure(other).totalTokens + 2048 + 900
+	await assert.rejects(b.engine.finalize(fakeAgent(other), { ...AUTO, limits: { target: 100000, window } }), /truncated/)
+	const caps = b.model.calls.filter((call) => call.kind === 'final').map((call) => call.maxTokens)
+	assert.equal(caps.length, 1, '被 room 壓低的最後一步也不加倍')
+	assert.ok(caps[0] < 1000 && caps[0] >= 500, String(caps))
+	assert.ok(ctx)
+})
+
+test('背景卡被截斷：記 warn，下一張背景卡用加倍的上限', async () => {
+	const { engine, model, ctx } = makeEngine()
+	const session = working(12)
+	model.respond = (kind, request) => {
+		if (request.maxTokens < 1000) throw Object.assign(new Error('output truncated'), { code: 'MAX_TOKENS' })
+		return 'card body'
+	}
+	await engine.maybeStartBackground(session)
+	await sleep(5)
+	assert.equal(engine.state(session).cardCap, 1000)
+	assert.ok(ctx.logs.some(([level, message]) => level === 'warn' && /next card cap 1000/.test(message)), JSON.stringify(ctx.logs))
+	engine.state(session).lastBackgroundAt = 0
+	await engine.maybeStartBackground(session)
+	await sleep(5)
+	assert.equal(model.calls.at(-1).maxTokens, 1000)
+	assert.ok(engine.state(session).cards.size > 0)
+})
+
+const overflowConfig = { ctxOptions: { contextWindow: 6000, defaultMaxTokens: 500 }, config: { nextStepReserveTokens: 200, finalMaxOutputTokens: 300 } }
+const overflowFailure = { code: 'CONTEXT_WINDOW_EXCEEDED', message: 'prepared prompt exceeds max_context' }
+
+test('context overflow：壓縮放得下的最長前段、保留其餘原文，回 retry；BLOCKED 時也照做', async () => {
+	const { engine, ctx } = makeEngine(overflowConfig)
+	const session = working(20, 1200)
+	engine.state(session).blocked = true
+	const total = ctx.tokenMeter.measure(session).totalTokens
+	assert.ok(total > 6000, `fixture overflows (${total})`)
+	const [onError] = ctx.handlers.get('agent/request-error')
+	let passed = false
+	const action = await onError({ agent: fakeAgent(session), failure: overflowFailure, signal: new AbortController().signal }, async () => { passed = true })
+	assert.deepEqual(action, { kind: 'retry' })
+	assert.equal(passed, false)
+	assert.equal(engine.state(session).blocked, false)
+	assert.ok(session.nodes.length > 2, '尾段保留原文')
+	assert.ok(ctx.tokenMeter.measure(session).totalTokens < 6000)
+})
+
+test('context overflow：同一串只救一次；模型回覆後重置；其他錯誤與不擁有的 agent 不處理', async () => {
+	const { engine, ctx, model } = makeEngine(overflowConfig)
+	const [onError] = ctx.handlers.get('agent/request-error')
+	const signal = new AbortController().signal
+	const session = working(20, 1200)
+	model.respond = () => { throw new Error('provider down') }
+	let passed = 0
+	const next = async () => { passed += 1 }
+	assert.equal(await onError({ agent: fakeAgent(session), failure: overflowFailure, signal }, next), undefined)
+	assert.ok(ctx.logs.some(([level, message]) => level === 'warn' && /overflow recovery failed/.test(message)))
+	const calls = model.calls.length
+	await onError({ agent: fakeAgent(session), failure: overflowFailure, signal }, next)
+	assert.equal(model.calls.length, calls, '第二次不再嘗試')
+	for (const handler of ctx.handlers.get('session/event')) handler(session, { type: 'assistant/message', seq: 999, data: {} })
+	await onError({ agent: fakeAgent(session), failure: overflowFailure, signal }, next)
+	assert.ok(model.calls.length > calls, '模型回覆後可以再救')
+
+	const before = model.calls.length
+	await onError({ agent: fakeAgent(working(20, 1200)), failure: { code: 'RATE_LIMITED' }, signal }, next)
+	assert.equal(model.calls.length, before)
+	assert.equal(passed, 4)
+})
+
+test("context overflow：補救失敗後 agent 閒置就重置，下一次 overflow 還能再救", async () => {
+	const { ctx, model } = makeEngine(overflowConfig)
+	const [onError] = ctx.handlers.get("agent/request-error")
+	const [onStatus] = ctx.handlers.get("agent/status")
+	const signal = new AbortController().signal
+	const session = working(20, 1200)
+	const agent = fakeAgent(session)
+	const respond = model.respond
+	model.respond = () => { throw new Error("provider down") }
+	await onError({ agent, failure: overflowFailure, signal }, async () => {})
+	const calls = model.calls.length
+	onStatus({ agent, status: "idle" })
+	model.respond = respond
+	assert.deepEqual(await onError({ agent, failure: overflowFailure, signal }, async () => {}), { kind: "retry" })
+	assert.ok(model.calls.length > calls)
+})
+
+test('context overflow：補救時最後一步與卡片的上限都不超過視窗 1/8', async () => {
+	const { ctx, model, engine } = makeEngine({ ctxOptions: { contextWindow: 16000, defaultMaxTokens: 500 }, config: { nextStepReserveTokens: 200, finalMaxOutputTokens: 32768, cardMaxOutputTokens: 500 } })
+	const session = working(40, 1200)
+	engine.state(session).cardCap = 32768
+	const [onError] = ctx.handlers.get('agent/request-error')
+	await onError({ agent: fakeAgent(session), failure: overflowFailure, signal: new AbortController().signal }, async () => {})
+	const caps = model.calls.map((call) => [call.kind, call.maxTokens])
+	assert.ok(caps.length > 0)
+	assert.ok(caps.every(([, cap]) => cap <= 2000), JSON.stringify(caps))
+})
+
+test('context overflow：自動 finalize 因預留而停用的小視窗，補救照樣可以做', async () => {
+	const { ctx, engine } = makeEngine({ ctxOptions: { contextWindow: 32768, defaultMaxTokens: 16384 }, config: { nextStepReserveTokens: 16384, finalMaxOutputTokens: 32768, cardMaxOutputTokens: 4096 } })
+	const session = working(80, 2400)
+	assert.ok(ctx.tokenMeter.measure(session).totalTokens > 32768)
+	assert.ok((await engine.limitsFor(session.requestHeader(), undefined)).infeasible)
+	const [onError] = ctx.handlers.get('agent/request-error')
+	const action = await onError({ agent: fakeAgent(session), failure: overflowFailure, signal: new AbortController().signal }, async () => {})
+	assert.deepEqual(action, { kind: 'retry' })
+})
+
+test('context overflow：壓縮後仍超過視窗就保留壓縮、不重送', async () => {
+	const { ctx } = makeEngine(overflowConfig)
+	const session = working(20, 1200)
+	session.step('huge tool output', 9000)
+	const [onError] = ctx.handlers.get('agent/request-error')
+	let passed = false
+	const action = await onError({ agent: fakeAgent(session), failure: overflowFailure, signal: new AbortController().signal }, async () => { passed = true })
+	assert.equal(action, undefined)
+	assert.equal(passed, true)
+	assert.ok(ctx.logs.some(([level, message]) => level === 'warn' && /not retrying/.test(message)), JSON.stringify(ctx.logs.slice(-3)))
+})
